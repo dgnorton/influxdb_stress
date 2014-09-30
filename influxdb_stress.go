@@ -43,6 +43,10 @@ func main() {
 		return
 	}
 
+	if cfg.SeriesCnt < cfg.BatchSize {
+		cfg.SeriesCnt = cfg.BatchSize
+	}
+
 	rand.Seed(time.Now().UnixNano())
 
 	// Delete old stress test database, if it exists, and create new / empty db
