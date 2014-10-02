@@ -107,29 +107,18 @@ func (self *DBClient) Run() {
 	cfg := &influx.ClientConfig{Host: self.cfg.Address, Username: self.cfg.User, Password: self.cfg.Pwd, Database: self.cfg.DBName}
 	client, err := influx.NewClient(cfg)
 	fatalIfErr(err)
-
-	// Generate array of series which we will periodically update and
-	// send batches from.
-	series := make([]*influx.Series, seriesCnt)
-	for i := 0; i < seriesCnt; i++ {
-		series[i] = &influx.Series{
-			Name: fmt.Sprintf("%s.%s.series%d", self.cfg.SeriesBaseName, self.Name, i),
-			Columns: []string{"value"},
-			Points: [][]interface{}{},
-		}
-	}
 	
 	// Main client loop
-	i := 0
 	batch := make([]*influx.Series, batchSz)
 	for {
 		// Select the next batch from series array
 		for j := 0; j < batchSz; j++ {
-			s := series[i % batchSz]
-			// generate new value
-			genNewValue(s)
-			batch[j] = s
-			i++
+		        batch[j] = &influx.Series{
+        			        Name: fmt.Sprintf("%s.%s.series%d", self.cfg.SeriesBaseName, self.Name, rand.Int()),
+                                        Columns: []string{"value"},
+                                        Points: [][]interface{}{},
+                                        }
+                        genNewValue(batch[j])
 		}
 
 		// Write the batch to InfluxDB
