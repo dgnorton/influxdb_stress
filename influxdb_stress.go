@@ -1,96 +1,157 @@
 package main
 
 import (
-	"flag"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
-	"time"
 	"sync"
+	"text/template"
+	"time"
 
 	influx "github.com/influxdb/influxdb/client"
+	flag "launchpad.net/gnuflag"
 )
 
 type Config struct {
-	Address        string
-	DBName         string
-	User           string
-	Pwd            string
-	ClientCnt      int
-	SeriesCnt      int
-	SeriesBaseName string
-	BatchSize      int
-	Interval       int
+	Address string
+	DBName  string
+	User    string
+	Pwd     string
+
+	Writers              int
+	WriterSeriesCnt      int
+	WriterSeriesBaseName string
+	WriterBatchSize      int
+
+	Readers int
+
+	Interval int
+	ResetDB  bool
+	Help     bool
 }
 
-func main() {
-	var help bool
-	var cfg Config
-	flag.StringVar(&cfg.Address, "a", "localhost:8086", "IP:port of InfluxDB")
-	flag.StringVar(&cfg.DBName, "d", "stress_test", "influxDB database name")
-	flag.StringVar(&cfg.User, "u", "root", "influxDB user")
-	flag.StringVar(&cfg.Pwd, "p", "root", "influxDB password")
-	flag.IntVar(&cfg.ClientCnt, "c", 10, "number of influxDB clients to create")
-	flag.IntVar(&cfg.SeriesCnt, "s", 10, "number of series to generate per client")
-	flag.StringVar(&cfg.SeriesBaseName, "n", "stress", "series base name")
-	flag.IntVar(&cfg.BatchSize, "b", 10, "number of series to send per interval")
-	flag.IntVar(&cfg.Interval, "i", 1000, "milliseconds between batches")
-	flag.BoolVar(&help, "h", false, "show usage")
-	flag.Parse()
+const (
+	defaultAddress              = "localhost:8086"
+	defaultDatabase             = "stress_test"
+	defaultUser                 = "root"
+	defaultPwd                  = "root"
+	defaultWriters              = 10
+	defaultWriterSeriesCnt      = 10
+	defaultWriterSeriesBaseName = "stress"
+	defaultWriterBatchSize      = 10
+	defaultReaders              = 10
+	defaultInterval             = 1000
+)
 
-	if help {
+var cfg *Config
+
+func main() {
+	cfg = getConfig()
+
+	if cfg.Help {
 		flag.Usage()
 		return
 	}
 
-	if cfg.SeriesCnt < cfg.BatchSize {
-		cfg.SeriesCnt = cfg.BatchSize
+	if cfg.WriterSeriesCnt < cfg.WriterBatchSize {
+		cfg.WriterSeriesCnt = cfg.WriterBatchSize
 	}
 
 	rand.Seed(time.Now().UnixNano())
 
-	// Delete old stress test database, if it exists, and create new / empty db
+	if cfg.ResetDB {
+		err := deleteDB(cfg)
+		fatalIfErr(err)
+	}
+
+	err := createDB(cfg)
+	fatalIfErr(err)
+
+	allClientsDone := startClients(cfg)
+	<-allClientsDone
+}
+
+func startClients(cfg *Config) chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		log.Printf("Starting %d writers (randomly delayed)\n", cfg.Writers)
+		for i := 0; i < cfg.Writers; i++ {
+			wg.Add(1)
+			name := fmt.Sprintf("writer%d", i)
+			dbw := NewDBWriter(name, cfg, &wg)
+			go dbw.Run()
+		}
+
+		log.Printf("Starting %d readers (randomly delayed)\n", cfg.Readers)
+		for i := 0; i < cfg.Readers; i++ {
+			wg.Add(1)
+			name := fmt.Sprintf("reader%d", i)
+			dbr := NewDBReader(name, cfg, &wg)
+			go dbr.Run()
+		}
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+func createDB(cfg *Config) error {
 	clientCfg := &influx.ClientConfig{Host: cfg.Address, Username: cfg.User, Password: cfg.Pwd}
 	client, err := influx.NewClient(clientCfg)
-	fatalIfErr(err)
+	if err != nil {
+		return err
+	}
 	dblist, err := client.GetDatabaseList()
-	fatalIfErr(err)
+	if err != nil {
+		return err
+	}
+	if !dbExists(cfg.DBName, dblist) {
+		log.Printf("Creating database: %s\n", cfg.DBName)
+		err = client.CreateDatabase(cfg.DBName)
+	} else {
+		log.Printf("Database already exists: %s\n", cfg.DBName)
+	}
+	return err
+}
+
+func deleteDB(cfg *Config) error {
+	clientCfg := &influx.ClientConfig{Host: cfg.Address, Username: cfg.User, Password: cfg.Pwd}
+	client, err := influx.NewClient(clientCfg)
+	if err != nil {
+		return err
+	}
+	dblist, err := client.GetDatabaseList()
+	if err != nil {
+		return err
+	}
 	if dbExists(cfg.DBName, dblist) {
 		log.Printf("Deleting old database: %s\n", cfg.DBName)
 		err = client.DeleteDatabase(cfg.DBName)
-		fatalIfErr(err)
+		if err != nil {
+			return err
+		}
 	}
-	log.Printf("Creating database: %s\n", cfg.DBName)
-	err = client.CreateDatabase(cfg.DBName)
-	fatalIfErr(err)
-
-	log.Printf("Starting %d InfluxDB clients (randomly delayed)\n", cfg.ClientCnt)
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.ClientCnt; i++ {
-		wg.Add(1)
-		name := fmt.Sprintf("client%d", i)
-		c := NewDBClient(name, &cfg, &wg)
-		go c.Run()
-	}
-	wg.Wait()
+	return nil
 }
 
-type DBClient struct {
+type DBWriter struct {
 	Name string
-	cfg *Config
-	wg *sync.WaitGroup
+	cfg  *Config
+	wg   *sync.WaitGroup
 }
 
-func NewDBClient(name string, c *Config, wg *sync.WaitGroup) *DBClient {
-	dbc := &DBClient{name, c, wg}
-	return dbc
+func NewDBWriter(name string, c *Config, wg *sync.WaitGroup) *DBWriter {
+	dbw := &DBWriter{name, c, wg}
+	return dbw
 }
 
-func (self *DBClient) Run() {
+func (self *DBWriter) Run() {
 	defer self.wg.Done()
 
-	seriesCnt := self.cfg.SeriesCnt
-	batchSz := self.cfg.BatchSize
+	WriterSeriesCnt := self.cfg.WriterSeriesCnt
+	batchSz := self.cfg.WriterBatchSize
 	batchInterval := time.Duration(self.cfg.Interval)
 
 	// Wait a pseudo-random amount of time before starting so that not all
@@ -98,34 +159,32 @@ func (self *DBClient) Run() {
 	startDelay := time.Duration(rand.Intn(30000))
 	<-time.After(startDelay * time.Millisecond)
 
-	fmt.Printf("%s: started\n", self.Name)
-	defer fmt.Printf("%s: stoped\n", self.Name)
+	log.Printf("%s: started\n", self.Name)
+	defer log.Printf("%s: stoped\n", self.Name)
 
-	
-
-	// Connect to the new db
+	// Connect to the db
 	cfg := &influx.ClientConfig{Host: self.cfg.Address, Username: self.cfg.User, Password: self.cfg.Pwd, Database: self.cfg.DBName}
 	client, err := influx.NewClient(cfg)
 	fatalIfErr(err)
 
 	// Generate array of series which we will periodically update and
 	// send batches from.
-	series := make([]*influx.Series, seriesCnt)
-	for i := 0; i < seriesCnt; i++ {
+	series := make([]*influx.Series, WriterSeriesCnt)
+	for i := 0; i < WriterSeriesCnt; i++ {
 		series[i] = &influx.Series{
-			Name: fmt.Sprintf("%s.%s.series%d", self.cfg.SeriesBaseName, self.Name, i),
+			Name:    fmt.Sprintf("%s.%s.series%d", self.cfg.WriterSeriesBaseName, self.Name, i),
 			Columns: []string{"value"},
-			Points: [][]interface{}{},
+			Points:  [][]interface{}{},
 		}
 	}
-	
+
 	// Main client loop
 	i := 0
 	batch := make([]*influx.Series, batchSz)
 	for {
 		// Select the next batch from series array
 		for j := 0; j < batchSz; j++ {
-			s := series[i % batchSz]
+			s := series[i%batchSz]
 			// generate new value
 			genNewValue(s)
 			batch[j] = s
@@ -147,6 +206,91 @@ func genNewValue(s *influx.Series) {
 	s.Points = [][]interface{}{newVal}
 }
 
+type DBReader struct {
+	Name string
+	cfg  *Config
+	wg   *sync.WaitGroup
+}
+
+func NewDBReader(name string, c *Config, wg *sync.WaitGroup) *DBReader {
+	dbr := &DBReader{name, c, wg}
+	return dbr
+}
+
+func (self *DBReader) Run() {
+	defer self.wg.Done()
+
+	// Wait a pseudo-random amount of time before starting so that not all
+	// clients read the DB at the same time.
+	startDelay := time.Duration(rand.Intn(30000))
+	<-time.After(startDelay * time.Millisecond)
+
+	log.Printf("%s: started\n", self.Name)
+	defer log.Printf("%s: stoped\n", self.Name)
+
+	// Connect to the db
+	cfg := &influx.ClientConfig{Host: self.cfg.Address, Username: self.cfg.User, Password: self.cfg.Pwd, Database: self.cfg.DBName}
+	client, err := influx.NewClient(cfg)
+	fatalIfErr(err)
+
+	// Main read loop
+	readInterval := time.Duration(self.cfg.Interval)
+	for {
+		tmplTxt := queryTemplates[rand.Intn(len(queryTemplates))]
+		tmpl := template.Must(template.New("query").Funcs(queryTemplateFuncs).Parse(tmplTxt))
+		var query bytes.Buffer
+		err = tmpl.Execute(&query, nil)
+		fatalIfErr(err)
+		log.Printf("query = %s\n", query.String())
+		_, err := client.Query(query.String())
+		logIfErr(err)
+		<-time.After(readInterval * time.Millisecond)
+	}
+}
+
+func randSeries() string {
+	w := rand.Intn(cfg.Writers)
+	s := rand.Intn(cfg.WriterSeriesCnt)
+	series := fmt.Sprintf("%s.writer%d.series%d", cfg.WriterSeriesBaseName, w, s)
+	return series
+}
+
+var aggregates = []string{
+	"count(value)",
+	"min(value)",
+	"max(value)",
+	"mean(value)",
+	"mode(value)",
+	"median(value)",
+	"distinct(value)",
+	"percentile(value, 10)",
+	"histogram(value)",
+	"histogram(value, 10)",
+	"derivative(value)",
+	"sum(value)",
+	"stddev(value)",
+	"first(value)",
+	"last(value)",
+	"difference(value)",
+	"top(value, 10)",
+	"bottom(value, 10)",
+}
+
+func randAggregate() string {
+	return aggregates[rand.Intn(len(aggregates))]
+}
+
+var queryTemplateFuncs = template.FuncMap{
+	"randSeries":    randSeries,
+	"randAggregate": randAggregate,
+}
+
+var queryTemplates = []string{
+	"list series",
+	"select * from {{randSeries}}",
+	"select {{randAggregate}} from {{randSeries}}",
+}
+
 func dbExists(dbname string, dbList []map[string]interface{}) bool {
 	for _, db := range dbList {
 		if dbname == db["name"] {
@@ -160,4 +304,39 @@ func fatalIfErr(err error) {
 	if err != nil {
 		log.Fatalln(err)
 	}
+}
+
+func logIfErr(err error) {
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func getConfig() *Config {
+	var cfg Config
+	flag.StringVar(&cfg.Address, "a", defaultAddress, "IP:port of InfluxDB")
+	flag.StringVar(&cfg.Address, "address", defaultAddress, "IP:port of InfluxDB")
+	flag.StringVar(&cfg.DBName, "d", defaultDatabase, "influxDB database name")
+	flag.StringVar(&cfg.DBName, "database", defaultDatabase, "influxDB database name")
+	flag.StringVar(&cfg.User, "u", defaultUser, "influxDB user")
+	flag.StringVar(&cfg.User, "user", defaultUser, "influxDB user")
+	flag.StringVar(&cfg.Pwd, "p", defaultPwd, "influxDB password")
+	flag.StringVar(&cfg.Pwd, "password", defaultPwd, "influxDB password")
+	flag.IntVar(&cfg.Writers, "w", defaultWriters, "number of writers to create")
+	flag.IntVar(&cfg.Writers, "writers", defaultWriters, "number of writers to create")
+	flag.IntVar(&cfg.WriterSeriesCnt, "s", defaultWriterSeriesCnt, "number of series to generate per writer")
+	flag.IntVar(&cfg.WriterSeriesCnt, "series-cnt", defaultWriterSeriesCnt, "number of series to generate per writer")
+	flag.StringVar(&cfg.WriterSeriesBaseName, "n", defaultWriterSeriesBaseName, "series base name")
+	flag.StringVar(&cfg.WriterSeriesBaseName, "series-name", defaultWriterSeriesBaseName, "series base name")
+	flag.IntVar(&cfg.WriterBatchSize, "b", defaultWriterBatchSize, "number of series to write per interval")
+	flag.IntVar(&cfg.WriterBatchSize, "batch-size", defaultWriterBatchSize, "number of series to write per interval")
+	flag.IntVar(&cfg.Readers, "r", defaultReaders, "number of readers to create")
+	flag.IntVar(&cfg.Readers, "readers", defaultReaders, "number of readers to create")
+	flag.IntVar(&cfg.Interval, "i", defaultInterval, "milliseconds between writing batches")
+	flag.IntVar(&cfg.Interval, "interval", defaultInterval, "milliseconds between writing batches")
+	flag.BoolVar(&cfg.ResetDB, "reset-db", false, "drops & creates new database before starting")
+	flag.BoolVar(&cfg.Help, "h", false, "show usage")
+	flag.BoolVar(&cfg.Help, "help", false, "show usage")
+	flag.Parse(false)
+	return &cfg
 }
