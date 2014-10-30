@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -25,6 +27,8 @@ type Config struct {
 	WriterBatchSize      int
 
 	Readers int
+	QueriesFile string
+	Queries []string
 
 	Interval int
 	ResetDB  bool
@@ -41,6 +45,7 @@ const (
 	defaultWriterSeriesBaseName = "stress"
 	defaultWriterBatchSize      = 10
 	defaultReaders              = 10
+	defaultQueriesFile			= ""
 	defaultInterval             = 1000
 )
 
@@ -56,6 +61,14 @@ func main() {
 
 	if cfg.WriterSeriesCnt < cfg.WriterBatchSize {
 		cfg.WriterSeriesCnt = cfg.WriterBatchSize
+	}
+
+	if cfg.QueriesFile != "" {
+		var err error
+		cfg.Queries, err = loadTextFile(cfg.QueriesFile)
+		fatalIfErr(err)
+	} else {
+		cfg.Queries = queryTemplates
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -233,10 +246,12 @@ func (self *DBReader) Run() {
 	client, err := influx.NewClient(cfg)
 	fatalIfErr(err)
 
+	queries := self.cfg.Queries
+
 	// Main read loop
 	readInterval := time.Duration(self.cfg.Interval)
 	for {
-		tmplTxt := queryTemplates[rand.Intn(len(queryTemplates))]
+		tmplTxt := queries[rand.Intn(len(queries))]
 		tmpl := template.Must(template.New("query").Funcs(queryTemplateFuncs).Parse(tmplTxt))
 		var query bytes.Buffer
 		err = tmpl.Execute(&query, nil)
@@ -289,6 +304,7 @@ var queryTemplates = []string{
 	"list series",
 	"select * from {{randSeries}}",
 	"select {{randAggregate}} from {{randSeries}}",
+	"select derivative(value) from {{randSeries}} group by time(20s)",
 }
 
 func dbExists(dbname string, dbList []map[string]interface{}) bool {
@@ -312,6 +328,15 @@ func logIfErr(err error) {
 	}
 }
 
+func loadTextFile(path string) ([]string, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(b), "\n")
+	return lines, nil
+}
+
 func getConfig() *Config {
 	var cfg Config
 	flag.StringVar(&cfg.Address, "a", defaultAddress, "IP:port of InfluxDB")
@@ -332,6 +357,8 @@ func getConfig() *Config {
 	flag.IntVar(&cfg.WriterBatchSize, "batch-size", defaultWriterBatchSize, "number of series to write per interval")
 	flag.IntVar(&cfg.Readers, "r", defaultReaders, "number of readers to create")
 	flag.IntVar(&cfg.Readers, "readers", defaultReaders, "number of readers to create")
+	flag.StringVar(&cfg.QueriesFile, "q", defaultQueriesFile, "path to file containing query templates")
+	flag.StringVar(&cfg.QueriesFile, "queries-file", defaultQueriesFile, "path to file containing query templates")
 	flag.IntVar(&cfg.Interval, "i", defaultInterval, "milliseconds between writing batches")
 	flag.IntVar(&cfg.Interval, "interval", defaultInterval, "milliseconds between writing batches")
 	flag.BoolVar(&cfg.ResetDB, "reset-db", false, "drops & creates new database before starting")
